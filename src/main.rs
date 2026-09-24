@@ -5,8 +5,10 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use rust_htslib::bam::{self, CompressionLevel, Read, Record};
-use rust_htslib::tpool::ThreadPool;
+use rust_htslib::bam::{self, Read, Record};
+
+mod output;
+use output::{IndexedBamWriter, ThreadPool};
 
 const PROGRAM: &str = "bam-zero-unmapped-mapq";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -15,7 +17,7 @@ const HELP: &str = "\
 bam-zero-unmapped-mapq - set MAPQ to 0 on reads carrying the BAM unmapped flag
 
 USAGE:
-    bam-zero-unmapped-mapq [OPTIONS] <INPUT.bam|-> <OUTPUT.bam|->
+    bam-zero-unmapped-mapq [OPTIONS] <INPUT.bam|-> <OUTPUT.bam>
 
 OPTIONS:
     -t, --threads N       BGZF worker threads [default: all logical CPUs]
@@ -24,7 +26,9 @@ OPTIONS:
     -h, --help            Print help
     -V, --version         Print version
 
-Use '-' for stdin or stdout. Use '--' before a path beginning with '-'.
+Use '-' for stdin. Use '--' before a path beginning with '-'.
+Input must be coordinate-sorted. A BAI index is built while writing the BAM
+and saved as <OUTPUT.bam>.bai. Output to stdout is not supported.
 ";
 
 #[derive(Debug)]
@@ -154,6 +158,9 @@ where
 
     let output = positionals.pop().expect("length checked");
     let input = positionals.pop().expect("length checked");
+    if is_stdio(&output) {
+        return Err("output must be a file path so its BAI index can be saved".to_owned());
+    }
 
     Ok(Command::Run(Args {
         input,
@@ -208,6 +215,11 @@ fn run(args: &Args) -> Result<Stats, Box<dyn Error>> {
         .into());
     }
 
+    // Declare the shared native pool first so it outlives both handles, including
+    // on early returns. HTSlib does not own an externally supplied pool.
+    let thread_pool = ThreadPool::new(args.threads)
+        .map_err(|error| contextual("cannot create HTSlib thread pool", error))?;
+
     let mut reader = if is_stdio(&args.input) {
         bam::Reader::from_stdin().map_err(|error| contextual("cannot open stdin", error))?
     } else {
@@ -219,40 +231,38 @@ fn run(args: &Args) -> Result<Stats, Box<dyn Error>> {
         })?
     };
 
-    let header = bam::Header::from_template(reader.header());
-    let mut writer = if is_stdio(&args.output) {
-        bam::Writer::from_stdout(&header, bam::Format::Bam)
-            .map_err(|error| contextual("cannot open stdout", error))?
-    } else {
-        bam::Writer::from_path(&args.output, &header, bam::Format::Bam).map_err(|error| {
-            contextual(
-                &format!("cannot create output '{}'", args.output.display()),
-                error,
-            )
-        })?
-    };
-
-    writer
-        .set_compression_level(CompressionLevel::Level(args.compression))
-        .map_err(|error| contextual("cannot set BAM compression level", error))?;
-
     // Sharing one native HTSlib pool lets BGZF decompression and compression overlap
     // without oversubscribing the machine with separate input and output pools.
-    let thread_pool = ThreadPool::new(args.threads)
-        .map_err(|error| contextual("cannot create HTSlib thread pool", error))?;
-    reader
-        .set_thread_pool(&thread_pool)
+    // SAFETY: reader is open and is dropped before thread_pool on every exit path.
+    unsafe { thread_pool.attach(reader.htsfile()) }
         .map_err(|error| contextual("cannot attach threads to input", error))?;
-    writer
-        .set_thread_pool(&thread_pool)
-        .map_err(|error| contextual("cannot attach threads to output", error))?;
 
-    process_records(&mut reader, &mut writer)
+    let mut writer = IndexedBamWriter::new(
+        &args.output,
+        reader.header().clone(),
+        args.compression,
+        &thread_pool,
+    )
+    .map_err(|error| {
+        contextual(
+            &format!("cannot create indexed output '{}'", args.output.display()),
+            error,
+        )
+    })?;
+
+    let stats = process_records(&mut reader, &mut writer)?;
+    writer.finish().map_err(|error| {
+        contextual(
+            &format!("cannot finish indexed output '{}'", args.output.display()),
+            error,
+        )
+    })?;
+    Ok(stats)
 }
 
 fn process_records(
     reader: &mut bam::Reader,
-    writer: &mut bam::Writer,
+    writer: &mut IndexedBamWriter<'_>,
 ) -> Result<Stats, Box<dyn Error>> {
     // Reusing this allocation is significantly cheaper than `reader.records()`, which
     // creates a fresh Record for each iteration.
