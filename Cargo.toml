@@ -1,0 +1,22 @@
+[package]
+name = "bam-zero-unmapped-mapq"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Fast, multithreaded BAM filter that sets MAPQ=0 on unmapped reads"
+license = "MIT"
+
+[dependencies]
+# 0.44.1 keeps bindgen optional and uses hts-sys's supplied Linux/macOS bindings.
+# Newer releases currently force bindgen, which is fragile on HPC login nodes whose
+# libclang installation cannot locate the compiler's standard C headers.
+rust-htslib = { version = "=0.44.1", default-features = false, features = ["libdeflate"] }
+# rust-htslib 0.44.1 declares a semver range beginning at 2.1.1, but hts-sys
+# 2.2.x changed generated C types incompatibly. Keep the matching bindings.
+hts-sys = { version = "=2.1.1", default-features = false }
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+strip = "symbols"
